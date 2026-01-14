@@ -82,7 +82,7 @@ import json
 from datetime import datetime
 
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"  # Added XDFPATCH Community Patchlist support
 __author__ = "Jason King"
 __author_github__ = "KingAiCodeForge"
 __author_alias__ = "kingaustraliagg"  # PCMHacking forum username
@@ -128,7 +128,8 @@ class UniversalXDFExporter:
         self.elements = {
             'constants': [],
             'flags': [],
-            'tables': []
+            'tables': [],
+            'patches': []  # XDFPATCH elements (Community Patchlist support)
         }
         
         # BASEOFFSET handling for 512KB and other large bin files
@@ -227,11 +228,13 @@ class UniversalXDFExporter:
         self._extract_constants()
         self._extract_flags()
         self._extract_tables()
+        self._extract_patches()  # XDFPATCH support for Community Patchlist
         
         self.logger.info(
             f"Parsed XDF: {len(self.elements['constants'])} constants, "
             f"{len(self.elements['flags'])} flags, "
-            f"{len(self.elements['tables'])} tables"
+            f"{len(self.elements['tables'])} tables, "
+            f"{len(self.elements['patches'])} patches"
         )
         
         return True
@@ -749,6 +752,122 @@ class UniversalXDFExporter:
                     'decimalpl': decimalpl
                 })
     
+    def _extract_patches(self):
+        """
+        Extract all XDFPATCH elements (Community Patchlist support)
+        
+        XDFPATCH elements define binary patches that can be applied/unapplied.
+        Each patch has:
+        - title: Patch name (e.g., "[PATCH] Alpha/N")
+        - description: What the patch does
+        - XDFPATCHENTRY elements with address, patchdata, and basedata
+        
+        This checks the BIN to determine if each patch is applied or not.
+        """
+        for patch in self.xdf_root.findall('.//XDFPATCH'):
+            title = self._get_title(patch)
+            category = self._get_category_name(patch)
+            
+            # Get description
+            desc_elem = patch.find('.//description')
+            description = ""
+            if desc_elem is not None and desc_elem.text:
+                description = desc_elem.text.strip()
+                # Clean up XML entities
+                description = description.replace('&#013;&#010;', '\n')
+                description = description.replace('&#013;', '\r')
+                description = description.replace('&#010;', '\n')
+            
+            # Extract all patch entries
+            entries = []
+            for entry in patch.findall('.//XDFPATCHENTRY'):
+                entry_name = entry.get('name', 'Unknown')
+                addr_str = entry.get('address', '0')
+                size_str = entry.get('datasize', '0')
+                patch_data = entry.get('patchdata', '')
+                base_data = entry.get('basedata', '')
+                
+                try:
+                    # Parse address and size
+                    address = int(addr_str, 16) if addr_str.startswith('0x') else int(addr_str)
+                    datasize = int(size_str, 16) if size_str.startswith('0x') else int(size_str)
+                    
+                    entries.append({
+                        'name': entry_name,
+                        'address': address,
+                        'datasize': datasize,
+                        'patchdata': patch_data.upper(),
+                        'basedata': base_data.upper()
+                    })
+                except ValueError:
+                    continue
+            
+            if entries:
+                # Check if patch is applied
+                patch_status = self._check_patch_status(entries)
+                
+                self.elements['patches'].append({
+                    'title': title,
+                    'description': description,
+                    'category': category,
+                    'entries': entries,
+                    'status': patch_status
+                })
+    
+    def _check_patch_status(self, entries: List[Dict]) -> str:
+        """
+        Check if a patch is applied, not applied, or partially applied
+        
+        Args:
+            entries: List of XDFPATCHENTRY dictionaries
+            
+        Returns:
+            str: 'applied', 'not_applied', 'partial', or 'unknown'
+        """
+        if not entries or self.bin_data is None:
+            return 'unknown'
+        
+        applied_count = 0
+        base_count = 0
+        total = len(entries)
+        
+        for entry in entries:
+            address = entry['address']
+            datasize = entry['datasize']
+            patch_data = entry['patchdata']
+            base_data = entry['basedata']
+            
+            # Convert address to file offset
+            file_offset = self._xdf_addr_to_file_offset(address)
+            
+            # Validate offset
+            if file_offset < 0 or file_offset + datasize > self.bin_size:
+                continue
+            
+            # Read actual bytes from BIN
+            actual_bytes = self.bin_data[file_offset:file_offset + datasize]
+            actual_hex = actual_bytes.hex().upper()
+            
+            # Check if matches patch or base data
+            if patch_data and actual_hex == patch_data:
+                applied_count += 1
+            elif base_data and actual_hex == base_data:
+                base_count += 1
+        
+        # Determine status
+        if applied_count == total:
+            return 'applied'
+        elif base_count == total:
+            return 'not_applied'
+        elif applied_count > 0 and base_count > 0:
+            return 'partial'
+        elif applied_count > 0:
+            return 'applied'
+        elif base_count > 0:
+            return 'not_applied'
+        else:
+            return 'unknown'
+
     def read_value_from_bin(self, address: int, size_bits: int, 
                            signed: bool = False,
                            lsb_first: bool = False) -> Optional[int]:
@@ -1232,6 +1351,68 @@ class UniversalXDFExporter:
                             "for this binary.\n"
                         )
                 
+                # Export PATCHES (Community Patchlist support)
+                if self.elements['patches']:
+                    f.write("\n" + "=" * 60 + "\n")
+                    f.write("PATCHES (Community Patchlist)\n")
+                    f.write("=" * 60 + "\n\n")
+                    
+                    # Group by status
+                    applied = [p for p in self.elements['patches'] 
+                               if p['status'] == 'applied']
+                    not_applied = [p for p in self.elements['patches'] 
+                                   if p['status'] == 'not_applied']
+                    partial = [p for p in self.elements['patches'] 
+                               if p['status'] == 'partial']
+                    unknown = [p for p in self.elements['patches'] 
+                               if p['status'] == 'unknown']
+                    
+                    # Summary
+                    f.write(f"Total Patches: {len(self.elements['patches'])}\n")
+                    f.write(f"  ✓ Applied: {len(applied)}\n")
+                    f.write(f"  ✗ Not Applied: {len(not_applied)}\n")
+                    if partial:
+                        f.write(f"  ⚠ Partial: {len(partial)}\n")
+                    if unknown:
+                        f.write(f"  ? Unknown: {len(unknown)}\n")
+                    f.write("\n" + "-" * 60 + "\n\n")
+                    
+                    # Applied patches
+                    if applied:
+                        f.write("✓ APPLIED PATCHES:\n")
+                        f.write("-" * 40 + "\n")
+                        for patch in applied:
+                            f.write(f"  {patch['title']}\n")
+                            if patch['description']:
+                                # Truncate long descriptions
+                                desc = patch['description'][:200]
+                                if len(patch['description']) > 200:
+                                    desc += "..."
+                                f.write(f"    → {desc}\n")
+                        f.write("\n")
+                    
+                    # Not applied patches
+                    if not_applied:
+                        f.write("✗ NOT APPLIED PATCHES:\n")
+                        f.write("-" * 40 + "\n")
+                        for patch in not_applied:
+                            f.write(f"  {patch['title']}\n")
+                            if patch['description']:
+                                desc = patch['description'][:200]
+                                if len(patch['description']) > 200:
+                                    desc += "..."
+                                f.write(f"    → {desc}\n")
+                        f.write("\n")
+                    
+                    # Partial patches (potential issues)
+                    if partial:
+                        f.write("⚠ PARTIALLY APPLIED PATCHES:\n")
+                        f.write("-" * 40 + "\n")
+                        for patch in partial:
+                            f.write(f"  {patch['title']}\n")
+                            f.write("    → WARNING: Patch may be corrupted or incompletely applied\n")
+                        f.write("\n")
+                
                 self.logger.info(f"Export complete: {output_path}")
                 return True
                 
@@ -1265,11 +1446,13 @@ class UniversalXDFExporter:
                 'statistics': {
                     'scalars_count': len(self.elements['constants']),
                     'flags_count': len(self.elements['flags']),
-                    'tables_count': len(self.elements['tables'])
+                    'tables_count': len(self.elements['tables']),
+                    'patches_count': len(self.elements['patches'])
                 },
                 'scalars': [],
                 'flags': [],
-                'tables': []
+                'tables': [],
+                'patches': []
             }
             
             # Export scalars
@@ -1375,6 +1558,17 @@ class UniversalXDFExporter:
                         }
                 
                 export_data['tables'].append(table_entry)
+            
+            # Export patches
+            for patch in self.elements['patches']:
+                patch_entry = {
+                    'title': patch['title'],
+                    'category': patch['category'],
+                    'description': patch['description'],
+                    'status': patch['status'],
+                    'entries_count': len(patch['entries'])
+                }
+                export_data['patches'].append(patch_entry)
             
             # Write JSON
             with open(output_path, 'w', encoding='utf-8') as f:
@@ -1550,10 +1744,47 @@ class UniversalXDFExporter:
                     
                     f.write("\n")
                 
+                # Export patches
+                if self.elements['patches']:
+                    f.write("\n---\n\n## Patches (Community Patchlist)\n\n")
+                    
+                    applied = [p for p in self.elements['patches'] 
+                               if p['status'] == 'applied']
+                    not_applied = [p for p in self.elements['patches'] 
+                                   if p['status'] == 'not_applied']
+                    
+                    f.write(f"**Total Patches:** {len(self.elements['patches'])}\n")
+                    f.write(f"- ✅ Applied: {len(applied)}\n")
+                    f.write(f"- ❌ Not Applied: {len(not_applied)}\n\n")
+                    
+                    if applied:
+                        f.write("### ✅ Applied Patches\n\n")
+                        for patch in applied:
+                            f.write(f"- **{patch['title']}**")
+                            if patch['description']:
+                                desc = patch['description'][:150]
+                                if len(patch['description']) > 150:
+                                    desc += "..."
+                                f.write(f": {desc}")
+                            f.write("\n")
+                        f.write("\n")
+                    
+                    if not_applied:
+                        f.write("### ❌ Not Applied Patches\n\n")
+                        for patch in not_applied:
+                            f.write(f"- **{patch['title']}**")
+                            if patch['description']:
+                                desc = patch['description'][:150]
+                                if len(patch['description']) > 150:
+                                    desc += "..."
+                                f.write(f": {desc}")
+                            f.write("\n")
+                        f.write("\n")
+                
                 # Footer
-                f.write(f"---\n\n")
+                f.write("---\n\n")
                 f.write(f"*Generated by KingAI TunerPro Exporter v{self.VERSION}*\n")
-                f.write(f"*Author: {self.AUTHOR_ALIAS} ({self.AUTHOR}) - GitHub: [{self.AUTHOR_GITHUB}](https://github.com/{self.AUTHOR_GITHUB})*\n")
+                f.write(f"*Author: {self.AUTHOR_ALIAS} ({self.AUTHOR})*\n")
             
             self.logger.info(f"Markdown export complete: {output_path}")
             return True
@@ -1682,13 +1913,18 @@ def main():
         print(f"  • {len(exporter.elements['constants'])} scalars")
         print(f"  • {len(exporter.elements['flags'])} flags")
         print(f"  • {len(exporter.elements['tables'])} tables")
+        if exporter.elements['patches']:
+            applied = len([p for p in exporter.elements['patches'] 
+                          if p['status'] == 'applied'])
+            total = len(exporter.elements['patches'])
+            print(f"  • {total} patches ({applied} applied)")
         print()
         print("Output files:")
         for fmt, path in outputs:
             print(f"  [{fmt}] {path}")
         print()
         print(f"Exporter: KingAI TunerPro Exporter v{__version__}")
-        print(f"Author: {__author_alias__} ({__author__}) - GitHub: {__author_github__}")
+        print(f"Author: {__author_alias__} ({__author__})")
         sys.exit(0)
     else:
         print("❌ Export Failed - Check log messages above")

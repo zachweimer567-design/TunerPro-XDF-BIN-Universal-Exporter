@@ -39,13 +39,38 @@ This tool was built to solve that problem. It reads the XDF definition and BIN f
 | Statistics (min/max/avg) | ✗ | **✓ Included** |
 | Zero-value warnings | ✗ | **✓ Warns user** |
 | Multi-format export | ✗ | **✓ TXT/JSON/MD/CSV** |
+| **XDFPATCH detection** | ✗ | **✓ Shows applied patches** |
 
 ### 🔧 Supported XDF Variations
 
 - Standard format (`mmedaddress`, `mmedelementsizebits`)
 - Alternative format (`mmedtypeflags`)
-- All element types: `XDFCONSTANT`, `XDFFLAG`, `XDFTABLE`, `XDFHEADER`
+- All element types: `XDFCONSTANT`, `XDFFLAG`, `XDFTABLE`, `XDFHEADER`, `XDFPATCH`
 - Various structural variations
+
+### 🔌 XDFPATCH Support (Community Patchlist)
+
+**NEW in v3.2.0!** Full support for BMW MS4X and similar Community Patchlist XDF files:
+
+- Detects all `XDFPATCH` elements (Immobilizer Bypass, Alpha/N, Launch Control, etc.)
+- Checks if each patch is **Applied**, **Not Applied**, or **Partial**
+- Exports patch status in all output formats (TXT, JSON, Markdown)
+- Perfect for analyzing BMW MS42/MS43 tunes with community patches
+
+Example output:
+```
+PATCHES (Community Patchlist)
+============================================================
+Total Patches: 27
+  ✓ Applied: 11
+  ✗ Not Applied: 12
+
+✓ APPLIED PATCHES:
+  [PATCH] Alpha/N
+    → Uses ip_maf_1_diag__n__tps_av table for load values
+  [PATCH] Launch Control & Rolling Anti Lag
+  [PATCH] Immobilizer Bypass
+```
 
 ### 📄 Output Formats
 
