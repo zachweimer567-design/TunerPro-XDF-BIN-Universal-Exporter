@@ -8,6 +8,8 @@
 **Universal XDF to Text Exporter - Enhanced Beyond TunerPro**
 
 A powerful Python tool that exports ECU calibration data from TunerPro XDF definition files combined with BIN firmware files to multiple formats: TXT, JSON, and Markdown.
+its needing to be fixed now the xdf for 2.09a with enhanced bin for vy v6 anymore since last update, isnt exporting properly alot of maps are out of wack.... same with 92118883.bin the stock oem tune.\
+need to check with terminal against the xdf and this code for the reasons why could be math?
 
 ---
 
