@@ -1106,7 +1106,7 @@ def main():
     app.setApplicationName("KingAI TunerPro Exporter")
     app.setApplicationVersion(__version__)
     app.setOrganizationName("KingAI Pty Ltd")
-    app.setOrganizationDomain("kingaituning.com.au")
+    app.setOrganizationDomain("www.kingai.com.au")
     
     # Create and show main window
     window = TunerProExporterGUI()

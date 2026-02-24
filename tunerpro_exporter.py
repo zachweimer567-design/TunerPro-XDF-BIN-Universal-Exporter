@@ -22,7 +22,7 @@
    * Statistical analysis (min/max/avg/unique count)
    * Zero-value detection for mismatched XDF/BIN pairs
    * Suspicious data pattern warnings
- - No hex addresses shown (clean presentation)
+ - Optional hex addresses (--addresses flag for XDF creation)
  - Case-insensitive math evaluation
  - Comprehensive validation and error handling
  
@@ -33,7 +33,7 @@
  ✅ Zero-value detection (catches XDF/BIN mismatches)
  ✅ Data integrity warnings (prevents bad tunes)
  ✅ Multiple output formats (TXT, JSON, MD, TEXT)
- 
+ needs adding - full xdf meta data and address and constants and cpu address for high and low banked binarys? maybe a v2 for this with more handling 
 ===============================================================================
  AUTHOR INFORMATION
 ===============================================================================
@@ -89,7 +89,25 @@ if sys.platform == 'win32':
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 
-__version__ = "3.2.0"  # Added XDFPATCH Community Patchlist support
+def safe_print(text: str):
+    """Print text safely, replacing unicode characters that can't be encoded on Windows"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        # Replace common unicode symbols with ASCII equivalents
+        replacements = {
+            '✅': '[OK]',
+            '❌': '[FAIL]',
+            '⚠️': '[WARN]',
+            '•': '*',
+            '°': 'deg',
+        }
+        for char, replacement in replacements.items():
+            text = text.replace(char, replacement)
+        print(text.encode('ascii', 'replace').decode('ascii'))
+
+
+__version__ = "3.4.0"  # Linked variable resolution, TunerPro if() ternary, float bitshift fixes
 __author__ = "Jason King"
 __author_github__ = "KingAiCodeForge"
 __author_alias__ = "kingaustraliagg"  # PCMHacking forum username
@@ -145,9 +163,18 @@ class UniversalXDFExporter:
         self.base_offset = 0
         self.base_subtract = 0  # 0 or 1
         
+        # Index of elements by uniqueid for embedinfo axis linking (MS42/MS43 style XDFs)
+        self.uniqueid_index = {}
+        
         # Validation statistics
         self.validation_warnings = []
         self.suspicious_tables = []
+        
+        # Output options
+        self.show_addresses = False  # Show hex addresses in output
+        self.flip_rpm = False        # Flip Y-axis (RPM: high→low)
+        self.flip_load = False       # Flip X-axis (load: high→low)
+        self.no_stats = False        # Omit statistics from output
     
     def _format_value(self, value: float, decimalpl: int = 2) -> str:
         """
@@ -163,6 +190,40 @@ class UniversalXDFExporter:
         if decimalpl <= 0:
             return str(int(round(value)))
         return f"{value:.{decimalpl}f}"
+
+    def _apply_axis_flips(self, table_data, axes):
+        """
+        Apply --flip-rpm and --flip-load axis transforms.
+
+        Reverses axis labels and corresponding data rows/columns
+        so the presentation order changes without altering raw data.
+
+        Args:
+            table_data: 2D list of floats (rows × cols)
+            axes: dict with 'x', 'y', 'z' axis info
+
+        Returns:
+            tuple: (flipped_data, flipped_axes)
+        """
+        import copy
+        data = [list(row) for row in table_data]
+        ax = copy.deepcopy(axes)
+
+        # Flip Y-axis (RPM) → reverse row order
+        if self.flip_rpm and 'y' in ax:
+            data = list(reversed(data))
+            if ax['y'].get('labels'):
+                ax['y']['labels'] = list(
+                    reversed(ax['y']['labels']))
+
+        # Flip X-axis (load) → reverse column order
+        if self.flip_load and 'x' in ax:
+            data = [list(reversed(row)) for row in data]
+            if ax['x'].get('labels'):
+                ax['x']['labels'] = list(
+                    reversed(ax['x']['labels']))
+
+        return data, ax
         
     def validate_bin_file(self) -> bool:
         """
@@ -230,6 +291,9 @@ class UniversalXDFExporter:
         
         # Extract categories
         self._extract_categories()
+        
+        # Build uniqueid index for embedinfo axis linking (MS42/MS43 XDFs)
+        self._build_uniqueid_index()
         
         # Extract all elements (universal approach)
         self._extract_constants()
@@ -301,6 +365,247 @@ class UniversalXDFExporter:
                     idx = int(index)
                 self.categories[idx] = name
     
+    def _build_uniqueid_index(self):
+        """
+        Build index of all elements by uniqueid for embedinfo axis linking.
+        
+        MS42/MS43 XDFs use embedinfo to link axes to shared axis tables.
+        Example: <embedinfo type="3" linkobjid="0xAA0D" />
+        This links to a table with uniqueid="0xAA0D" containing axis values.
+        
+        This index allows O(1) lookup of linked elements.
+        """
+        # Index all XDFTABLE elements
+        for table in self.xdf_root.findall('.//XDFTABLE'):
+            uid = table.get('uniqueid')
+            if uid:
+                self.uniqueid_index[uid] = table
+        
+        # Index all XDFCONSTANT elements (scalars can be axis sources too)
+        for const in self.xdf_root.findall('.//XDFCONSTANT'):
+            uid = const.get('uniqueid')
+            if uid:
+                self.uniqueid_index[uid] = const
+        
+        if self.uniqueid_index:
+            self.logger.info(
+                f"Built uniqueid index: {len(self.uniqueid_index)} elements "
+                f"(embedinfo axis linking enabled)"
+            )
+    
+    def _resolve_linked_vars(self, math_elem) -> Dict[str, float]:
+        """
+        Resolve linked variable values from MATH VAR elements.
+        
+        TunerPro MATH blocks can contain VAR elements that link to
+        other XDF elements:
+          <MATH equation="X/(128/B)/C">
+              <VAR id="X" />
+              <VAR id="B" type="link" linkid="0xA15" />
+              <VAR id="C" type="link" linkid="0x2D12" />
+          </MATH>
+        
+        For type="link" vars, read the linked element's value from
+        the binary and return it in a dict for the eval namespace.
+        
+        For vars without type="link" (like plain X or E), the value
+        comes from context (raw_value, row_index, etc.) so they are
+        not resolved here.
+        
+        Args:
+            math_elem: MATH XML element containing VAR children
+            
+        Returns:
+            Dict mapping variable names to resolved float values
+        """
+        linked_vars = {}
+        if math_elem is None:
+            return linked_vars
+        
+        for var_elem in math_elem.findall('.//VAR'):
+            var_id = var_elem.get('id', '')
+            var_type = var_elem.get('type', '')
+            link_id = var_elem.get('linkid', '')
+            
+            if var_type == 'link' and link_id:
+                # Resolve the linked element's value
+                linked_elem = self.uniqueid_index.get(link_id)
+                if linked_elem is None:
+                    self.logger.debug(
+                        f"Linked var {var_id} -> {link_id} "
+                        f"not found in index"
+                    )
+                    continue
+                
+                # Read the linked element's value from binary
+                embedded = self._parse_embedded_data(linked_elem)
+                addr = embedded['address']
+                if addr is not None:
+                    raw = self.read_value_from_bin(
+                        addr,
+                        embedded['size_bits'],
+                        signed=embedded['signed'],
+                        lsb_first=embedded['lsb_first']
+                    )
+                    if raw is not None:
+                        # Apply the linked element's own math if it
+                        # has a simple equation (avoid recursion)
+                        linked_math = linked_elem.find('.//MATH')
+                        if linked_math is not None:
+                            eq = linked_math.get('equation', '')
+                            # Only apply simple equations (no links)
+                            has_links = any(
+                                v.get('type') == 'link'
+                                for v in linked_math.findall('.//VAR')
+                            )
+                            if eq and not has_links:
+                                val, _ = self.evaluate_math(
+                                    eq, raw
+                                )
+                                if val is not None:
+                                    linked_vars[var_id] = val
+                                    continue
+                        linked_vars[var_id] = float(raw)
+        
+        return linked_vars
+    
+    def _resolve_embedinfo_axis(self, axis_elem) -> List[float]:
+        """
+        Resolve axis values from embedinfo link (MS42/MS43 style).
+        
+        When an axis has <embedinfo type="3" linkobjid="0xXXXX" />,
+        the actual axis breakpoint values come from the linked table's
+        Z-axis data, read from the binary and transformed by MATH.
+        
+        Args:
+            axis_elem: XDFAXIS element with embedinfo
+            
+        Returns:
+            List[float]: Axis values from linked table, or empty if failed
+        """
+        embedinfo = axis_elem.find('.//embedinfo')
+        if embedinfo is None:
+            return []
+        
+        link_type = embedinfo.get('type')
+        link_id = embedinfo.get('linkobjid')
+        
+        # type="3" means link to another XDF object
+        if link_type != '3' or not link_id:
+            return []
+        
+        # Find linked element by uniqueid
+        linked_elem = self.uniqueid_index.get(link_id)
+        if linked_elem is None:
+            self.logger.warning(
+                f"embedinfo link not found: {link_id}"
+            )
+            return []
+        
+        # Get Z-axis from linked table (contains actual breakpoint values)
+        z_axis = linked_elem.find(".//XDFAXIS[@id='z']")
+        if z_axis is None:
+            # Fallback: try to get Y-axis labels from linked table
+            y_axis = linked_elem.find(".//XDFAXIS[@id='y']")
+            if y_axis is not None:
+                return self._extract_direct_labels(y_axis)
+            return []
+        
+        # Parse Z-axis EMBEDDEDDATA
+        z_embedded = z_axis.find('.//EMBEDDEDDATA')
+        if z_embedded is None:
+            return []
+        
+        # Get address
+        addr_str = z_embedded.get('mmedaddress', '0')
+        try:
+            address = int(addr_str, 16) if addr_str.startswith('0x') else int(addr_str)
+        except ValueError:
+            return []
+        
+        # Get size and count
+        size_bits = 8  # Default
+        size_str = z_embedded.get('mmedelementsizebits', '8')
+        try:
+            size_bits = int(size_str)
+        except ValueError:
+            pass
+        
+        row_count = 1
+        row_str = z_embedded.get('mmedrowcount', '1')
+        try:
+            row_count = int(row_str)
+        except ValueError:
+            pass
+        
+        # Get indexcount if row_count is 1
+        if row_count <= 1:
+            count_elem = axis_elem.find('.//indexcount')
+            if count_elem is not None and count_elem.text:
+                try:
+                    row_count = int(count_elem.text.strip())
+                except ValueError:
+                    pass
+        
+        # Get math equation
+        z_math = z_axis.find('.//MATH')
+        equation = None
+        if z_math is not None:
+            equation = z_math.get('equation', '')
+        
+        # Check for signed/endian flags (XDF 1.50: Bit 0 = LSB first, Bit 1 = Signed)
+        signed = False
+        lsb_first = False
+        typeflags = z_embedded.get('mmedtypeflags', '0')
+        try:
+            flags = int(typeflags, 16) if typeflags.startswith('0x') else int(typeflags)
+            lsb_first = (flags & 0x01) != 0  # Bit 0
+            signed = (flags & 0x02) != 0      # Bit 1
+        except ValueError:
+            pass
+        
+        # Read values from binary using read_value_from_bin
+        values = []
+        byte_size = size_bits // 8
+        if byte_size < 1:
+            byte_size = 1
+        
+        for i in range(row_count):
+            addr = address + (i * byte_size)
+            raw_value = self.read_value_from_bin(
+                addr, size_bits,
+                signed=signed,
+                lsb_first=lsb_first)
+            if raw_value is None:
+                break
+            
+            # Apply math equation
+            if equation:
+                final_value, _ = self.evaluate_math(equation, raw_value)
+                if final_value is not None:
+                    values.append(final_value)
+                else:
+                    values.append(float(raw_value))
+            else:
+                values.append(float(raw_value))
+        
+        return values
+    
+    def _extract_direct_labels(self, axis_elem) -> List[float]:
+        """
+        Extract LABEL values directly without embedinfo resolution.
+        Helper for _resolve_embedinfo_axis fallback.
+        """
+        labels = []
+        for label_elem in axis_elem.findall('.//LABEL'):
+            value_str = label_elem.get('value', '')
+            if value_str:
+                try:
+                    labels.append(float(value_str))
+                except ValueError:
+                    pass
+        return labels
+
     def _get_address(self, element) -> Optional[int]:
         """
         Universal address extraction - handles all XDF variations
@@ -403,11 +708,13 @@ class UniversalXDFExporter:
                 pass
         
         # Type flags (signedness and endianness)
+        # XDF 1.50 spec: Bit 0 = LSB first (little-endian), Bit 1 = Signed
+        # 0x00 = Unsigned MSB, 0x01 = LSB first, 0x02 = Signed, 0x03 = Signed + LSB
         flags_str = embedded.get('mmedtypeflags', '0x00')
         try:
             flags = int(flags_str, 16) if flags_str.startswith('0x') else int(flags_str)
             result['lsb_first'] = bool(flags & 0x01)  # Bit 0 = LSB first
-            result['signed'] = bool(flags & 0x02)     # Bit 1 = Signed
+            result['signed'] = bool(flags & 0x02)      # Bit 1 = Signed
         except ValueError:
             pass
         
@@ -565,8 +872,10 @@ class UniversalXDFExporter:
             # Get math equation
             math_elem = const.find('.//MATH')
             equation = None
+            linked_vars = {}
             if math_elem is not None:
                 equation = math_elem.get('equation', '')
+                linked_vars = self._resolve_linked_vars(math_elem)
             
             # Get decimal places for precision (BUG FIX #9)
             decimalpl = 2  # Default
@@ -618,6 +927,7 @@ class UniversalXDFExporter:
                 'lsb_first': embedded['lsb_first'],
                 'unit': unit,
                 'equation': equation,
+                'linked_vars': linked_vars,
                 'category': category,
                 'decimalpl': decimalpl,
                 'min': min_val,
@@ -653,7 +963,11 @@ class UniversalXDFExporter:
     
     def _extract_axis_labels(self, axis_elem) -> List[float]:
         """
-        Extract and process axis label values
+        Extract and process axis label values.
+        
+        Supports two methods:
+        1. embedinfo linking (MS42/MS43 style) - axis values from linked table
+        2. Direct LABEL values (VY V6/legacy style) - hardcoded in XDF
         
         Args:
             axis_elem: XDF XDFAXIS element
@@ -661,13 +975,27 @@ class UniversalXDFExporter:
         Returns:
             List[float]: Processed label values
         """
+        # Method 1: Check for embedinfo linking first (MS42/MS43 XDFs)
+        embedinfo = axis_elem.find('.//embedinfo')
+        if embedinfo is not None:
+            link_type = embedinfo.get('type')
+            if link_type == '3':
+                linked_values = self._resolve_embedinfo_axis(axis_elem)
+                if linked_values:
+                    return linked_values
+        
+        # Method 2: Direct LABEL extraction (VY V6/legacy XDFs)
         labels = []
         
         # Get math equation for labels
         math_elem = axis_elem.find('.//MATH')
         equation = None
+        label_linked_vars = {}
         if math_elem is not None:
             equation = math_elem.get('equation', '')
+            label_linked_vars = self._resolve_linked_vars(
+                math_elem
+            )
         
         # Extract all label values
         for label_elem in axis_elem.findall('.//LABEL'):
@@ -681,7 +1009,10 @@ class UniversalXDFExporter:
                 
                 # Apply math equation if present
                 if equation:
-                    final_value, error = self.evaluate_math(equation, raw_value)
+                    final_value, error = self.evaluate_math(
+                        equation, raw_value,
+                        linked_vars=label_linked_vars
+                    )
                     if final_value is not None:
                         labels.append(final_value)
                     else:
@@ -737,11 +1068,15 @@ class UniversalXDFExporter:
                 if unit_elem is not None and unit_elem.text:
                     unit = unit_elem.text.strip()
                 
-                # Get math equation
+                # Get math equation and linked vars
                 math_elem = axis.find('.//MATH')
                 equation = None
+                axis_linked_vars = {}
                 if math_elem is not None:
                     equation = math_elem.get('equation', '')
+                    axis_linked_vars = self._resolve_linked_vars(
+                        math_elem
+                    )
                 
                 # Get axis-specific decimal places
                 axis_decimalpl = decimalpl  # Default to table's decimalpl
@@ -760,6 +1095,7 @@ class UniversalXDFExporter:
                     'count': count,
                     'unit': unit,
                     'equation': equation,
+                    'linked_vars': axis_linked_vars,
                     'labels': axis_labels,
                     'size_bits': embedded['size_bits'],
                     'signed': embedded['signed'],
@@ -987,6 +1323,7 @@ class UniversalXDFExporter:
         size_bits = z_axis.get('size_bits', 8)
         size_bytes = size_bits // 8
         math_eq = z_axis.get('equation', '')
+        z_linked_vars = z_axis.get('linked_vars', {})
         signed = z_axis.get('signed', False)
         lsb_first = z_axis.get('lsb_first', False)
         
@@ -1055,7 +1392,10 @@ class UniversalXDFExporter:
                         'y_axis_value': y_axis.get('labels', [])[row] if row < len(y_axis.get('labels', [])) else 0,
                         'x_axis_value': x_axis.get('labels', [])[col] if col < len(x_axis.get('labels', [])) else 0
                     }
-                    final_value, _ = self.evaluate_math(math_eq, raw_value, axis_context)
+                    final_value, _ = self.evaluate_math(
+                        math_eq, raw_value, axis_context,
+                        linked_vars=z_linked_vars
+                    )
                     if final_value is not None:
                         row_data.append(final_value)
                     else:
@@ -1106,7 +1446,10 @@ class UniversalXDFExporter:
             'stats': stats
         }
     
-    def evaluate_math(self, equation: str, raw_value: int, axis_context: Optional[Dict] = None) -> Tuple[Optional[float], str]:
+    def evaluate_math(self, equation: str, raw_value: int,
+                       axis_context: Optional[Dict] = None,
+                       linked_vars: Optional[Dict[str, float]] = None
+                       ) -> Tuple[Optional[float], str]:
         """
         Evaluate math equation with comprehensive variable and function support
         
@@ -1116,11 +1459,15 @@ class UniversalXDFExporter:
         - #3: Exponential/math functions (exp, log, sqrt, pow)
         - #4: Null equation handling ((null), null, empty)
         - #7: Multi-variable support (A, B, Y, E, Z for tables)
+        - #11: Linked variable resolution (VAR type="link")
         
         Args:
             equation: Math equation string (e.g., "0.75 * X - 40")
             raw_value: Raw binary value
-            axis_context: Optional dict with 'row_index', 'col_index', 'x_axis_value', 'y_axis_value'
+            axis_context: Optional dict with 'row_index', 'col_index',
+                         'x_axis_value', 'y_axis_value'
+            linked_vars: Optional dict of resolved linked variable values
+                        from _resolve_linked_vars()
             
         Returns:
             Tuple[Optional[float], str]: (result, error_message)
@@ -1155,7 +1502,33 @@ class UniversalXDFExporter:
             # Replace named variables like X1000, X100, X10 with the raw value
             equation_fixed = re.sub(r'\bX\d+\b', str(raw_value), equation_fixed, flags=re.IGNORECASE)
             
+            # BUG FIX #8: Convert TunerPro if(cond ; true ; false) ternary to Python
+            # TunerPro uses: if ( condition ; value_if_true ; value_if_false )
+            # Python needs:  (value_if_true) if (condition) else (value_if_false)
+            tp_if_match = re.match(
+                r'^\s*if\s*\(\s*(.+?)\s*;\s*(.+?)\s*;\s*(.+?)\s*\)\s*$',
+                equation_fixed, re.IGNORECASE
+            )
+            if tp_if_match:
+                cond_part = tp_if_match.group(1).strip()
+                true_part = tp_if_match.group(2).strip()
+                false_part = tp_if_match.group(3).strip()
+                equation_fixed = f"({true_part}) if ({cond_part}) else ({false_part})"
+            
+            # BUG FIX #9: Ensure bitshift operands are integers
+            # Python's >> and << require int operands, but XDF axis values
+            # may be floats. Wrap variable references in int() where >> or << appear.
+            if '>>' in equation_fixed or '<<' in equation_fixed:
+                equation_fixed = re.sub(r'\bY\b', 'int(Y)', equation_fixed)
+                equation_fixed = re.sub(r'\bX\b', 'int(X)', equation_fixed)
+                equation_fixed = re.sub(r'\bA\b', 'int(A)', equation_fixed)
+                equation_fixed = re.sub(r'\bB\b', 'int(B)', equation_fixed)
+                # Clean up double-wrapping: int(int(X)) -> int(X)
+                equation_fixed = re.sub(r'int\(int\(', 'int(', equation_fixed)
+            
             # BUG FIX #3 & #7: Create comprehensive evaluation namespace
+            # Default E to 1 (not 0) — for scalars E=element count=1
+            # This prevents div-by-zero in formulas like X/2.56/E
             namespace = {
                 # Primary data value
                 'X': raw_value,
@@ -1164,10 +1537,12 @@ class UniversalXDFExporter:
                 # Multi-variable support (for tables with axis context)
                 'A': axis_context.get('row_index', 0),
                 'a': axis_context.get('row_index', 0),
-                'B': axis_context.get('col_index', 0),
-                'b': axis_context.get('col_index', 0),
-                'E': axis_context.get('row_index', 0),  # Alternative to A
-                'e': axis_context.get('row_index', 0),
+                'B': axis_context.get('col_index', 1),
+                'b': axis_context.get('col_index', 1),
+                'C': axis_context.get('c_value', 1),
+                'c': axis_context.get('c_value', 1),
+                'E': axis_context.get('row_index', 1),
+                'e': axis_context.get('row_index', 1),
                 'Y': axis_context.get('y_axis_value', 0),
                 'y': axis_context.get('y_axis_value', 0),
                 'Z': axis_context.get('x_axis_value', 0),
@@ -1180,17 +1555,28 @@ class UniversalXDFExporter:
                 'sqrt': math.sqrt,
                 'pow': math.pow,
                 'abs': abs,
+                'int': int,
+                'float': float,
                 'sin': math.sin,
                 'cos': math.cos,
                 'tan': math.tan,
                 
                 # Mathematical constants
-                'E': math.e,
+                # BUG FIX #10: Don't overwrite 'E' row_index with math.e
+                # Use 'euler_e' or only set 'E' to math.e if not used as axis
                 'PI': math.pi,
                 'pi': math.pi,
                 
                 '__builtins__': {}
             }
+            
+            # BUG FIX #11: Apply linked variable overrides
+            # Linked vars (from VAR type="link") take priority
+            # over default axis context values
+            if linked_vars:
+                for var_name, var_val in linked_vars.items():
+                    namespace[var_name] = var_val
+                    namespace[var_name.lower()] = var_val
             
             # Evaluate the expression
             result = eval(equation_fixed, namespace)
@@ -1258,7 +1644,10 @@ class UniversalXDFExporter:
                         if const['equation']:
                             calc_value, error = self.evaluate_math(
                                 const['equation'],
-                                raw_value
+                                raw_value,
+                                linked_vars=const.get(
+                                    'linked_vars', {}
+                                )
                             )
                             if calc_value is not None:
                                 value = calc_value
@@ -1280,7 +1669,11 @@ class UniversalXDFExporter:
                         
                         # Write in TunerPro format: single line, right-aligned
                         title = const['title'][:48]  # Truncate long titles
-                        f.write(f"SCALAR: {title:<48} {value_str:>22}\n")
+                        if self.show_addresses and const['address'] is not None:
+                            addr_str = f"[0x{const['address']:04X}]"
+                            f.write(f"SCALAR: {addr_str} {title:<44} {value_str:>18}\n")
+                        else:
+                            f.write(f"SCALAR: {title:<48} {value_str:>22}\n")
                 
                 # Export FLAGS
                 if self.elements['flags']:
@@ -1302,7 +1695,12 @@ class UniversalXDFExporter:
                         status = "Set" if is_set else "Not Set"
                         
                         # Write in TunerPro format: simple Set/Not Set
-                        f.write(f"FLAG: {flag['title']:<50} {status:>20}\n")
+                        if self.show_addresses and flag['address'] is not None:
+                            addr_str = f"[0x{flag['address']:04X}]"
+                            mask_str = f"mask=0x{flag['mask']:02X}"
+                            f.write(f"FLAG: {addr_str} {mask_str} {flag['title']:<40} {status:>10}\n")
+                        else:
+                            f.write(f"FLAG: {flag['title']:<50} {status:>20}\n")
                 
                 # Export TABLES with FULL DATA
                 if self.elements['tables']:
@@ -1315,6 +1713,12 @@ class UniversalXDFExporter:
                     for table in self.elements['tables']:
                         f.write(f"TABLE: {table['title']}\n")
                         f.write(f"  Category: {table['category']}\n")
+                        if self.show_addresses:
+                            z_axis = table['axes'].get('z', {})
+                            if z_axis.get('address') is not None:
+                                f.write(f"  Address: 0x{z_axis['address']:04X}\n")
+                            elif table.get('address') is not None:
+                                f.write(f"  Address: 0x{table['address']:04X}\n")
                         
                         # Write axis information with labels
                         axes = table['axes']
@@ -1361,12 +1765,19 @@ class UniversalXDFExporter:
                         table_data = self._read_table_data(table)
                         
                         if table_data is not None:
+                            # Apply axis flips
+                            if self.flip_rpm or self.flip_load:
+                                table_data, axes = (
+                                    self._apply_axis_flips(
+                                        table_data, axes))
+
                             validation = self._validate_table_data(
                                 table, table_data
                             )
                             
                             # Show statistics
-                            if 'stats' in validation:
+                            if ('stats' in validation
+                                    and not self.no_stats):
                                 stats = validation['stats']
                                 f.write("  Statistics:\n")
                                 f.write(
@@ -1453,23 +1864,24 @@ class UniversalXDFExporter:
                     # Summary warnings for zero tables
                     if zero_tables:
                         f.write("\n" + "=" * 60 + "\n")
-                        f.write("⚠️ DATA VALIDATION WARNINGS\n")
+                        f.write("📊 ZERO-VALUE TABLES REPORT\n")
                         f.write("=" * 60 + "\n\n")
                         total = len(self.elements['tables'])
                         f.write(
                             f"Found {len(zero_tables)} of {total} "
                             f"tables with all-zero values:\n\n"
                         )
-                        for table_title in zero_tables[:10]:
+                        # Show ALL zero tables (not truncated)
+                        for table_title in zero_tables:
                             f.write(f"  • {table_title}\n")
-                        if len(zero_tables) > 10:
-                            extra = len(zero_tables) - 10
-                            f.write(f"  ... and {extra} more\n")
                         f.write(
-                            "\nThis strongly suggests "
-                            "XDF/BIN version mismatch!\n"
-                            "Verify you're using the correct XDF "
-                            "for this binary.\n"
+                            "\n" + "-" * 60 + "\n"
+                            "NOTE: Zero tables may indicate:\n"
+                            "  1. XDF/BIN version mismatch (wrong definition file)\n"
+                            "  2. Intentional OEM zeroing (e.g., Alpina B3 strategy)\n"
+                            "  3. Unused features in this calibration variant\n"
+                            "\nAlpina 'Zero Complex, Tune Simple' strategy intentionally\n"
+                            "zeros interacting tables to force simpler fallback paths.\n"
                         )
                 
                 # Export PATCHES (Community Patchlist support)
@@ -1589,7 +2001,10 @@ class UniversalXDFExporter:
                 value = raw_value
                 if const['equation']:
                     calc_value, _ = self.evaluate_math(
-                        const['equation'], raw_value
+                        const['equation'], raw_value,
+                        linked_vars=const.get(
+                            'linked_vars', {}
+                        )
                     )
                     if calc_value is not None:
                         value = calc_value
@@ -1654,9 +2069,27 @@ class UniversalXDFExporter:
                 # Extract full table data
                 table_data = self._read_table_data(table)
                 if table_data is not None:
-                    # Round values for JSON using proper precision
+                    # Apply axis flips (uses deep copy)
+                    flipped_axes = table['axes']
+                    if self.flip_rpm or self.flip_load:
+                        table_data, flipped_axes = (
+                            self._apply_axis_flips(
+                                table_data,
+                                table['axes']))
+                        # Update JSON labels
+                        for aid in ('x', 'y'):
+                            fa = flipped_axes.get(aid)
+                            te = table_entry['axes'].get(
+                                aid)
+                            if fa and te and fa.get(
+                                    'labels'):
+                                te['labels'] = fa[
+                                    'labels']
+
+                    # Round values for JSON
                     table_entry['data'] = [
-                        [round(v, z_decimalpl) for v in row] for row in table_data
+                        [round(v, z_decimalpl) for v in row]
+                        for row in table_data
                     ]
                     table_entry['dimensions'] = {
                         'rows': len(table_data),
@@ -1669,14 +2102,22 @@ class UniversalXDFExporter:
                     }
                     
                     # Add statistics
-                    flat = [v for row in table_data for v in row]
-                    if flat:
-                        table_entry['statistics'] = {
-                            'min': round(min(flat), z_decimalpl),
-                            'max': round(max(flat), z_decimalpl),
-                            'avg': round(statistics.mean(flat), z_decimalpl),
-                            'unique_count': len(set(round(v, z_decimalpl) for v in flat))
-                        }
+                    if not self.no_stats:
+                        flat = [v for row in table_data
+                                for v in row]
+                        if flat:
+                            table_entry['statistics'] = {
+                                'min': round(
+                                    min(flat), z_decimalpl),
+                                'max': round(
+                                    max(flat), z_decimalpl),
+                                'avg': round(
+                                    statistics.mean(flat),
+                                    z_decimalpl),
+                                'unique_count': len(set(
+                                    round(v, z_decimalpl)
+                                    for v in flat))
+                            }
                 
                 export_data['tables'].append(table_entry)
             
@@ -1755,7 +2196,10 @@ class UniversalXDFExporter:
                     value = raw_value
                     if const['equation']:
                         calc_value, _ = self.evaluate_math(
-                            const['equation'], raw_value
+                            const['equation'], raw_value,
+                            linked_vars=const.get(
+                                'linked_vars', {}
+                            )
                         )
                         if calc_value is not None:
                             value = calc_value
@@ -1807,9 +2251,16 @@ class UniversalXDFExporter:
                     # Extract table data
                     table_data = self._read_table_data(table)
                     if table_data is not None:
+                        # Apply axis flips
+                        if self.flip_rpm or self.flip_load:
+                            table_data, axes = (
+                                self._apply_axis_flips(
+                                    table_data, axes))
+
                         # Statistics
-                        flat = [v for row in table_data for v in row]
-                        if flat:
+                        flat = [v for row in table_data
+                                for v in row]
+                        if flat and not self.no_stats:
                             z_unit = axes.get('z', {}).get('unit', '')
                             f.write(f"**Statistics:**\n")
                             f.write(f"- Min: {min(flat):.4f} {z_unit}\n")
@@ -1914,6 +2365,136 @@ class UniversalXDFExporter:
             self.logger.error(f"Markdown export failed: {e}")
             return False
 
+    def export_to_csv(self, output_path: str) -> bool:
+        """
+        Export data to CSV format for spreadsheet analysis.
+
+        Produces one row per scalar/flag and per table cell, with
+        columns: Type, Category, Title, Address, RawValue, Value,
+        Unit, Row, Col, RowLabel, ColLabel.
+
+        Args:
+            output_path: Output CSV file path
+
+        Returns:
+            bool: True if successful
+        """
+        import csv
+        try:
+            with open(output_path, 'w', newline='',
+                       encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Type', 'Category', 'Title', 'Address',
+                    'RawValue', 'Value', 'Unit',
+                    'Row', 'Col', 'RowLabel', 'ColLabel'
+                ])
+
+                # Scalars
+                for const in self.elements['constants']:
+                    raw = self.read_value_from_bin(
+                        const['address'], const['size'],
+                        signed=const.get('signed', False),
+                        lsb_first=const.get('lsb_first', False)
+                    )
+                    if raw is None:
+                        continue
+                    value = raw
+                    if const['equation']:
+                        cv, _ = self.evaluate_math(
+                            const['equation'], raw,
+                            linked_vars=const.get(
+                                'linked_vars', {}
+                            )
+                        )
+                        if cv is not None:
+                            value = cv
+                    dp = const.get('decimalpl', 2)
+                    val_str = self._format_value(
+                        value, dp) if isinstance(
+                            value, float) else str(value)
+                    addr = f"0x{const['address']:04X}"
+                    writer.writerow([
+                        'Scalar', const['category'],
+                        const['title'], addr,
+                        raw, val_str, const['unit'],
+                        '', '', '', ''
+                    ])
+
+                # Flags
+                for flag in self.elements['flags']:
+                    bv = self.read_value_from_bin(
+                        flag['address'], 8)
+                    if bv is None:
+                        continue
+                    is_set = (bv & flag['mask']) != 0
+                    addr = f"0x{flag['address']:04X}"
+                    writer.writerow([
+                        'Flag', flag['category'],
+                        flag['title'], addr,
+                        bv,
+                        'Set' if is_set else 'Not Set',
+                        f"mask=0x{flag['mask']:02X}",
+                        '', '', '', ''
+                    ])
+
+                # Tables — one row per cell
+                for table in self.elements['tables']:
+                    axes = table['axes']
+                    z_axis = axes.get('z', {})
+                    z_addr = z_axis.get('address')
+                    if z_addr is None:
+                        continue
+                    addr = f"0x{z_addr:04X}"
+                    tdata = self._read_table_data(table)
+                    if tdata is None:
+                        continue
+                    # Apply axis flips
+                    if self.flip_rpm or self.flip_load:
+                        tdata, axes = (
+                            self._apply_axis_flips(
+                                tdata, axes))
+                        continue
+                    y_labels = axes.get(
+                        'y', {}).get('labels', [])
+                    x_labels = axes.get(
+                        'x', {}).get('labels', [])
+                    z_dp = z_axis.get('decimalpl', 2)
+                    z_unit = z_axis.get('unit', '')
+                    for r, row in enumerate(tdata):
+                        rl = (self._format_value(
+                            y_labels[r],
+                            axes.get('y', {}).get(
+                                'decimalpl', 2))
+                            if r < len(y_labels)
+                            else str(r))
+                        for c, val in enumerate(row):
+                            cl = (self._format_value(
+                                x_labels[c],
+                                axes.get('x', {}).get(
+                                    'decimalpl', 2))
+                                if c < len(x_labels)
+                                else str(c))
+                            writer.writerow([
+                                'Table',
+                                table['category'],
+                                table['title'],
+                                addr,
+                                '',
+                                self._format_value(
+                                    val, z_dp),
+                                z_unit,
+                                r, c, rl, cl
+                            ])
+
+            self.logger.info(
+                f"CSV export complete: {output_path}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"CSV export failed: {e}")
+            return False
+
     def export(self, output_path: str) -> bool:
         """
         Main export function - validates, parses, and exports
@@ -1938,7 +2519,9 @@ class UniversalXDFExporter:
 
 def main():
     """Command-line interface with multi-format support"""
-    if len(sys.argv) < 4 or len(sys.argv) > 5:
+    # Filter out option flags for argument count check
+    positional_args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    if len(positional_args) < 3 or len(positional_args) > 4:
         print("=" * 70)
         print("  KingAI TunerPro XDF + BIN Universal Exporter")
         print("=" * 70)
@@ -1955,9 +2538,11 @@ def main():
         print("  text - Same as txt")
         print("  json - JSON format for programmatic use")
         print("  md   - Markdown format for documentation")
-        print("  all  - Export all formats (txt, json, md)")
+        print("  csv  - Spreadsheet-compatible CSV format")
+        print("  all  - Export all formats (txt, json, md, csv)")
         print()
         print("Options:")
+        print("  --addresses    Include hex addresses in output (useful for XDF creation)")
         print("  --flip-rpm     Flip RPM axis (high-to-low instead of low-to-high)")
         print("  --flip-load    Flip load axis for presentation")
         print("  --no-stats     Omit statistical analysis from output")
@@ -1969,26 +2554,36 @@ def main():
         print(f"  python {sys.argv[0]} def.xdf fw.bin export.txt --flip-rpm")
         print()
         print("Features:")
-        print("  ✅ Full table data extraction (TunerPro fails at this!)")
-        print("  ✅ Axis label values displayed")
-        print("  ✅ Statistical analysis (min/max/avg)")
-        print("  ✅ Data integrity validation")
-        print("  ✅ Multiple output formats (TXT, JSON, MD)")
-        print("  ✅ Axis flip options for presentation preference")
+        safe_print("  ✅ Full table data extraction (TunerPro fails at this!)")
+        safe_print("  ✅ Axis label values displayed")
+        safe_print("  ✅ Statistical analysis (min/max/avg)")
+        safe_print("  ✅ Data integrity validation")
+        safe_print("  ✅ Multiple output formats (TXT, JSON, MD, CSV)")
+        safe_print("  ✅ Axis flip options for presentation preference")
         print()
         sys.exit(1)
     
-    xdf_file = sys.argv[1]
-    bin_file = sys.argv[2]
-    output_base = sys.argv[3]
-    export_format = sys.argv[4].lower() if len(sys.argv) > 4 else 'txt'
+    xdf_file = positional_args[0]
+    bin_file = positional_args[1]
+    output_base = positional_args[2]
+    export_format = positional_args[3].lower() if len(positional_args) > 3 else 'txt'
     
     # Normalize format
     if export_format == 'text':
         export_format = 'txt'
     
+    # Parse option flags
+    show_addresses = '--addresses' in sys.argv
+    flip_rpm = '--flip-rpm' in sys.argv
+    flip_load = '--flip-load' in sys.argv
+    no_stats = '--no-stats' in sys.argv
+    
     # Create exporter
     exporter = UniversalXDFExporter(xdf_file, bin_file)
+    exporter.show_addresses = show_addresses
+    exporter.flip_rpm = flip_rpm
+    exporter.flip_load = flip_load
+    exporter.no_stats = no_stats
     
     # Validate and parse
     if not exporter.validate_bin_file():
@@ -2028,24 +2623,33 @@ def main():
         else:
             success = False
     
+    if export_format in ('csv', 'all'):
+        csv_path = (base_dir / f"{base_name}.csv"
+                    if export_format == 'all'
+                    else output_base)
+        if exporter.export_to_csv(str(csv_path)):
+            outputs.append(('CSV', str(csv_path)))
+        else:
+            success = False
+    
     # Summary
     print()
     print("=" * 70)
     if success and outputs:
-        print("✅ Export Successful!")
+        safe_print("✅ Export Successful!")
         print("=" * 70)
         print(f"Definition: {exporter.definition_name}")
         print(f"Binary: {exporter.bin_path.name}")
         print()
         print("Elements exported:")
-        print(f"  • {len(exporter.elements['constants'])} scalars")
-        print(f"  • {len(exporter.elements['flags'])} flags")
-        print(f"  • {len(exporter.elements['tables'])} tables")
+        safe_print(f"  • {len(exporter.elements['constants'])} scalars")
+        safe_print(f"  • {len(exporter.elements['flags'])} flags")
+        safe_print(f"  • {len(exporter.elements['tables'])} tables")
         if exporter.elements['patches']:
             applied = len([p for p in exporter.elements['patches'] 
                           if p['status'] == 'applied'])
             total = len(exporter.elements['patches'])
-            print(f"  • {total} patches ({applied} applied)")
+            safe_print(f"  • {total} patches ({applied} applied)")
         print()
         print("Output files:")
         for fmt, path in outputs:
@@ -2055,7 +2659,7 @@ def main():
         print(f"Author: {__author_alias__} ({__author__})")
         sys.exit(0)
     else:
-        print("❌ Export Failed - Check log messages above")
+        safe_print("❌ Export Failed - Check log messages above")
         print("=" * 70)
         sys.exit(1)
 

@@ -29,7 +29,7 @@ This tool was built to solve that problem. It reads the XDF definition and BIN f
 
 ## 🌟 Features
 
-### ✅ Superior Data Extraction (vs TunerPro)
+### Data Extraction (vs TunerPro) (soon to add same export format as stock standard tunerpro as a on and off option in cli and gui)
 
 | Feature | TunerPro Export | KingAI Exporter |
 |---------|-----------------|-----------------|
@@ -477,16 +477,38 @@ ERROR: Address 0x90000 out of range for 512KB BIN file
 
 ## ⚠️ Compatibility Status & Known Issues
 
-### ✅ WORKING - Fully Tested XDF/BIN Combinations
+### ✅ WORKING - Fully Tested XDF/BIN Combinations (v3.4.0)
 
 | Platform | XDF | BIN Example | Status | Notes |
 |----------|-----|-------------|--------|-------|
-| **Holden VY V6 $060A** | VY_V6_$060A_Enhanced_V1.2 | 92118883.BIN | ✅ **Perfect** | Scalars, flags, tables all working |
-| **Holden VS V6 SC $51** | VS_V6_SC_$51_Enhanced | VS_V6_SC_$51_Enhanced_v1.0a.bin | ✅ **Perfect** | Full data extraction |
-| **Holden VX/VY V6 SC $07** | VY_V6_SC_$07_Enhanced | VX-VY_V6_SC_$07_Enhanced_v1.2.bin | ✅ **Perfect** | 175 tables, 245 scalars, 41 flags |
-| **BMW MS42 0110C6** | Siemens_MS42_0110C6 | Siemens_MS42_0110C6_512KB.bin | ✅ **Perfect** | 597 tables, 512KB bin support |
+| **Holden VY V6 $060A** | Enhanced v2.09b | VY_V6_Enhanced.bin | ✅ **Perfect** | 1310 scalars, 548 flags, 330 tables |
+| **Holden VY V6 $060A** | Enhanced v2.09a | VX-VY_V6_$060A_Enhanced_v1.0a.bin | ✅ **Perfect** | 1310 scalars, 351 flags, 330 tables |
+| **Holden VY V6 $060A** | Enhanced v2.04 | VX-VY_V6_$060A_Enhanced_v1.1a.bin | ✅ **Perfect** | 1163 scalars, 94 flags, 338 tables |
+| **Holden VX/VY V6 SC $07** | Enhanced v2.6h | VX-VY_V6_SC_$07_Enhanced_v1.2.bin | ✅ **Perfect** | 354 scalars, 60 flags, 175 tables |
+| **Holden VS V6 $51** | Enhanced v1.4f | VS_V6_$51_Enhanced_v1.4b.bin | ✅ **Perfect** | 681 scalars, 147 flags, 256 tables |
+| **Holden VS V6 SC $51** | Enhanced v1.0c | VS_V6_SC_$51_Enhanced_v1.0a.bin | ✅ **Perfect** | 679 scalars, 167 flags, 253 tables |
+| **Holden VS V8 $A6F** | Enhanced v0.90 | VS_V8_$A6F_Enhanced_v0.90.bin | ✅ **Perfect** | 110 scalars, 5 flags, 74 tables |
+| **Holden VT V6 $A5G** | Enhanced v1.0h | VT_V6_AUTO_$A5G_Enhanced_v1.1.bin | ✅ **Perfect** | 166 scalars, 8 flags, 108 tables |
+| **Holden VT V6 SC $A5G** | Enhanced v1.3h | VT_V6_SC_$A5G_Enhanced_v1.3.bin | ✅ **Perfect** | 158 scalars, 6 flags, 119 tables |
+| **Holden VT V8 $A6E** | Enhanced v1.03 | VT_V8_$A6E_Enhanced_v1.00.bin | ✅ **Perfect** | 81 scalars, 6 flags, 77 tables |
+| **Ford AU OSE 11P** | V104 decrypted | OSE_$11P V104 CAKH V6.BIN | ✅ **Perfect** | 616 scalars, 332 flags, 195 tables |
+| **Ford AU OSE 11B** | V106 | OSE_$11P V104 CAKH V6.BIN | ✅ **Perfect** | 746 scalars, 280 flags, 242 tables |
+| **BMW MS42 0110C6** | ENG 512K v1.1 | cfm54b30.bin | ✅ **Perfect** | 1384 scalars, 597 tables |
+| **BMW MS42 0110AD** | ENG 32KB | 25_MS42_0110AD_32KB_cut.bin | ✅ **Perfect** | 1347 scalars, 974 tables |
+| **BMW MS42 Community** | Patchlist v1.7.1 | cfm54b30.bin | ✅ **Perfect** | 1384 scalars, 597 tables |
 
-### 🔄 FIXED in v3.1.0 - Previously Broken (Now Working)
+### 🔄 FIXED in v3.3.0 & v3.4.0
+
+| Bug | Formula/Feature | Root Cause | Fix |
+|-----|-----------------|-----------|-----|
+| **#8** | `if(cond ; true ; false)` | TunerPro ternary syntax not valid Python | Convert to `(true) if (cond) else (false)` |
+| **#9** | Bitshift on float (`Y>>6`) | Python `>>` requires int operands | Auto-wrap vars in `int()` when bitshift ops present |
+| **#10** | `E` namespace collision | `E: math.e` was overwriting `E: row_index` | Removed `math.e` override for `E` |
+| **#11** | `X/(128/B)/C` div-by-zero | `B`, `C` are linked vars (`VAR type="link"`) not resolved | New `_resolve_linked_vars()` reads linked element values from binary |
+| **#11b** | `X/2.56/E` div-by-zero | `E` defaulted to `0` for scalars | `E` defaults to `1` (element count) for scalars |
+| **Embedinfo** | MS42/MS43 axis linking | Axis breakpoints stored in separate linked tables | `_build_uniqueid_index()` + `_resolve_embedinfo_axis()` |
+
+### 🔄 FIXED in v3.1.0
 
 | Platform | Issue | Fix Applied | Verified |
 |----------|-------|-------------|----------|
@@ -542,8 +564,9 @@ Some older XDF files use non-standard formats:
 
 ```
 kingai_tunerpro_bin_xdf_combined_export_to_any_document/
-├── tunerpro_exporter.py   # Main CLI exporter (1,690 lines, v3.1.0)
-├── exporter_gui.py        # PySide6 Qt GUI frontend (1,073 lines, v3.2.0)
+├── tunerpro_exporter.py   # Main CLI exporter (v3.4.0)
+├── exporter_gui.py        # PySide6 Qt GUI frontend (v3.2.0)
+├── regression_test.py     # Automated regression tests (16 XDF/BIN pairs)
 ├── install.bat            # Windows installer with PATH setup
 ├── launch_cli.bat         # Quick CLI launcher
 ├── launch_gui.bat         # Quick GUI launcher
@@ -583,11 +606,14 @@ class UniversalXDFExporter:
 | `_extract_constants()` | Parse all `<XDFCONSTANT>` elements |
 | `_extract_flags()` | Parse all `<XDFFLAG>` elements |
 | `_extract_tables()` | Parse all `<XDFTABLE>` elements with axes |
+| `_build_uniqueid_index()` | Build lookup index for linked variable resolution |
+| `_resolve_linked_vars()` | Resolve `VAR type="link"` elements to their binary values |
+| `_resolve_embedinfo_axis()` | Resolve MS42/MS43 embedinfo-linked axis breakpoints |
 | `_get_address(element)` | Universal address extraction (4 fallback methods) |
 | `_parse_embedded_data(element)` | Extract size, signedness, endianness from `mmedtypeflags` |
 | `_xdf_addr_to_file_offset(addr)` | Apply BASEOFFSET translation |
 | `read_value_from_bin(addr, size)` | Read raw bytes from BIN with correct endianness |
-| `evaluate_math(equation, raw)` | Apply XDF math equation (safe eval) |
+| `evaluate_math(equation, raw)` | Apply XDF math equation (safe eval, linked vars, ternary) |
 | `_read_table_data(table)` | Extract full 2D data matrix from table definition |
 | `_format_value(value, decimalpl)` | Format numeric value with correct decimals |
 
