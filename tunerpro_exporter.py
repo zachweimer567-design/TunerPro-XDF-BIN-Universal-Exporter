@@ -107,7 +107,7 @@ def safe_print(text: str):
         print(text.encode('ascii', 'replace').decode('ascii'))
 
 
-__version__ = "3.4.0"  # Linked variable resolution, TunerPro if() ternary, float bitshift fixes
+__version__ = "3.5.0"  # No truncation: full titles, full descriptions, proper decimalpl everywhere, address column in MD bitshift fixes
 __author__ = "Jason King"
 __author_github__ = "KingAiCodeForge"
 __author_alias__ = "kingaustraliagg"  # PCMHacking forum username
@@ -283,8 +283,20 @@ class UniversalXDFExporter:
             tree = ET.parse(self.xdf_path)
             self.xdf_root = tree.getroot()
         except ET.ParseError as e:
-            self.logger.error(f"Failed to parse XDF: {e}")
-            return False
+            # BUG FIX #13: Handle non-UTF-8 XDF files (e.g. German XDFs with
+            # Latin-1 encoded characters like ° 0xB0, ü 0xFC, etc.)
+            # Re-read as Latin-1, encode to UTF-8, then parse from string
+            self.logger.warning(f"XML parse failed ({e}), retrying with Latin-1 encoding...")
+            try:
+                raw = self.xdf_path.read_bytes()
+                # Decode as Latin-1 (ISO-8859-1) which maps all 0x00-0xFF bytes
+                text = raw.decode('latin-1')
+                # Strip any XML declaration that may specify wrong encoding
+                text = re.sub(r'<\?xml[^?]*\?>', '<?xml version="1.0" encoding="utf-8"?>', text, count=1)
+                self.xdf_root = ET.fromstring(text)
+            except Exception as e2:
+                self.logger.error(f"Failed to parse XDF even with Latin-1 fallback: {e2}")
+                return False
         
         # Extract header information
         self._extract_header()
@@ -553,14 +565,16 @@ class UniversalXDFExporter:
         if z_math is not None:
             equation = z_math.get('equation', '')
         
-        # Check for signed/endian flags (XDF 1.50: Bit 0 = LSB first, Bit 1 = Signed)
+        # TunerPro XDF mmedtypeflags bit definitions:
+        #   Bit 0 (0x01) = Signed
+        #   Bit 1 (0x02) = LSB first (little-endian)
         signed = False
         lsb_first = False
         typeflags = z_embedded.get('mmedtypeflags', '0')
         try:
             flags = int(typeflags, 16) if typeflags.startswith('0x') else int(typeflags)
-            lsb_first = (flags & 0x01) != 0  # Bit 0
-            signed = (flags & 0x02) != 0      # Bit 1
+            signed = (flags & 0x01) != 0      # Bit 0 = Signed
+            lsb_first = (flags & 0x02) != 0   # Bit 1 = LSB first (little-endian)
         except ValueError:
             pass
         
@@ -665,9 +679,9 @@ class UniversalXDFExporter:
         """
         Parse EMBEDDEDDATA attributes for address, size, signedness, and endianness
         
-        XDF mmedtypeflags bit meanings:
-        - Bit 0 (0x01): LSB first (little-endian). If not set, MSB first (big-endian)
-        - Bit 1 (0x02): Signed value. If not set, unsigned
+        XDF mmedtypeflags bit meanings (TunerPro spec):
+        - Bit 0 (0x01): Signed value. If not set, unsigned
+        - Bit 1 (0x02): LSB first (little-endian). If not set, MSB first (big-endian)
         - Other bits: Various flags (row/col major, etc.)
         
         Args:
@@ -708,13 +722,13 @@ class UniversalXDFExporter:
                 pass
         
         # Type flags (signedness and endianness)
-        # XDF 1.50 spec: Bit 0 = LSB first (little-endian), Bit 1 = Signed
-        # 0x00 = Unsigned MSB, 0x01 = LSB first, 0x02 = Signed, 0x03 = Signed + LSB
+        # TunerPro XDF spec: Bit 0 = Signed, Bit 1 = LSB first (little-endian)
+        # 0x00 = Unsigned MSB, 0x01 = Signed MSB, 0x02 = Unsigned LSB, 0x03 = Signed + LSB
         flags_str = embedded.get('mmedtypeflags', '0x00')
         try:
             flags = int(flags_str, 16) if flags_str.startswith('0x') else int(flags_str)
-            result['lsb_first'] = bool(flags & 0x01)  # Bit 0 = LSB first
-            result['signed'] = bool(flags & 0x02)      # Bit 1 = Signed
+            result['signed'] = bool(flags & 0x01)      # Bit 0 = Signed
+            result['lsb_first'] = bool(flags & 0x02)   # Bit 1 = LSB first (little-endian)
         except ValueError:
             pass
         
@@ -1495,8 +1509,10 @@ class UniversalXDFExporter:
         try:
             equation_fixed = equation.strip()
             
-            # Fix equations starting with operator (e.g., "*2**14" -> "X*2**14")
-            if equation_fixed.startswith(('*', '/', '+', '-')):
+            # Fix equations starting with * or / operator (e.g., "*2**14" -> "X*2**14")
+            # BUG FIX #12: Do NOT prepend X for leading - or + (unary sign/coefficient)
+            # e.g., "-0.375*X-60.0" is a valid equation with negative coefficient
+            if equation_fixed.startswith(('*', '/')):
                 equation_fixed = 'X' + equation_fixed
             
             # Replace named variables like X1000, X100, X10 with the raw value
@@ -1668,12 +1684,12 @@ class UniversalXDFExporter:
                             value_str += f" {const['unit']}"
                         
                         # Write in TunerPro format: single line, right-aligned
-                        title = const['title'][:48]  # Truncate long titles
+                        title = const['title']  # Full title, no truncation
                         if self.show_addresses and const['address'] is not None:
                             addr_str = f"[0x{const['address']:04X}]"
-                            f.write(f"SCALAR: {addr_str} {title:<44} {value_str:>18}\n")
+                            f.write(f"SCALAR: {addr_str} {title:<60} {value_str:>18}\n")
                         else:
-                            f.write(f"SCALAR: {title:<48} {value_str:>22}\n")
+                            f.write(f"SCALAR: {title:<60} {value_str:>22}\n")
                 
                 # Export FLAGS
                 if self.elements['flags']:
@@ -1917,11 +1933,7 @@ class UniversalXDFExporter:
                         for patch in applied:
                             f.write(f"  {patch['title']}\n")
                             if patch['description']:
-                                # Truncate long descriptions
-                                desc = patch['description'][:200]
-                                if len(patch['description']) > 200:
-                                    desc += "..."
-                                f.write(f"    → {desc}\n")
+                                f.write(f"    → {patch['description']}\n")
                         f.write("\n")
                     
                     # Not applied patches
@@ -1931,10 +1943,7 @@ class UniversalXDFExporter:
                         for patch in not_applied:
                             f.write(f"  {patch['title']}\n")
                             if patch['description']:
-                                desc = patch['description'][:200]
-                                if len(patch['description']) > 200:
-                                    desc += "..."
-                                f.write(f"    → {desc}\n")
+                                f.write(f"    → {patch['description']}\n")
                         f.write("\n")
                     
                     # Partial patches (potential issues)
@@ -2183,8 +2192,8 @@ class UniversalXDFExporter:
                 
                 # Scalars
                 f.write(f"---\n\n## Scalar Values\n\n")
-                f.write(f"| Parameter | Value | Unit | Category |\n")
-                f.write(f"|-----------|-------|------|----------|\n")
+                f.write(f"| Parameter | Value | Unit | Address | Category |\n")
+                f.write(f"|-----------|-------|------|---------|----------|\n")
                 
                 for const in self.elements['constants']:
                     raw_value = self.read_value_from_bin(
@@ -2204,12 +2213,14 @@ class UniversalXDFExporter:
                         if calc_value is not None:
                             value = calc_value
                     
-                    val_str = f"{value:.2f}" if isinstance(value, float) else str(value)
+                    decimalpl = const.get('decimalpl', 2)
+                    val_str = f"{value:.{decimalpl}f}" if isinstance(value, float) else str(value)
                     unit = const['unit'] or '-'
                     cat = const['category'] or 'Uncategorized'
                     title = const['title'].replace('|', '\\|')
+                    addr_str = f"0x{const['address']:04X}" if const['address'] is not None else '-'
                     
-                    f.write(f"| {title} | {val_str} | {unit} | {cat} |\n")
+                    f.write(f"| {title} | {val_str} | {unit} | {addr_str} | {cat} |\n")
                 
                 # Flags
                 f.write(f"\n---\n\n## Flags\n\n")
@@ -2262,10 +2273,11 @@ class UniversalXDFExporter:
                                 for v in row]
                         if flat and not self.no_stats:
                             z_unit = axes.get('z', {}).get('unit', '')
+                            z_dp = axes.get('z', {}).get('decimalpl', 2)
                             f.write(f"**Statistics:**\n")
-                            f.write(f"- Min: {min(flat):.4f} {z_unit}\n")
-                            f.write(f"- Max: {max(flat):.4f} {z_unit}\n")
-                            f.write(f"- Avg: {statistics.mean(flat):.4f} {z_unit}\n")
+                            f.write(f"- Min: {min(flat):.{z_dp}f} {z_unit}\n")
+                            f.write(f"- Max: {max(flat):.{z_dp}f} {z_unit}\n")
+                            f.write(f"- Avg: {statistics.mean(flat):.{z_dp}f} {z_unit}\n")
                             f.write(f"- Dimensions: {len(table_data)} × {len(table_data[0])}\n\n")
                         
                         # Full Data Table (all rows and columns)
@@ -2334,10 +2346,7 @@ class UniversalXDFExporter:
                         for patch in applied:
                             f.write(f"- **{patch['title']}**")
                             if patch['description']:
-                                desc = patch['description'][:150]
-                                if len(patch['description']) > 150:
-                                    desc += "..."
-                                f.write(f": {desc}")
+                                f.write(f": {patch['description']}")
                             f.write("\n")
                         f.write("\n")
                     
@@ -2346,10 +2355,7 @@ class UniversalXDFExporter:
                         for patch in not_applied:
                             f.write(f"- **{patch['title']}**")
                             if patch['description']:
-                                desc = patch['description'][:150]
-                                if len(patch['description']) > 150:
-                                    desc += "..."
-                                f.write(f": {desc}")
+                                f.write(f": {patch['description']}")
                             f.write("\n")
                         f.write("\n")
                 
