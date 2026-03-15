@@ -1,4 +1,7 @@
 # KingAI TunerPro Exporter - Git Ignore
+# only polished stuff with no hardpaths or personal data to go onto github.
+# so the sp daten to bin converter is going on if it works.
+
 
 # Python
 __pycache__/

@@ -107,7 +107,7 @@ def safe_print(text: str):
         print(text.encode('ascii', 'replace').decode('ascii'))
 
 
-__version__ = "3.5.0"  # No truncation: full titles, full descriptions, proper decimalpl everywhere, address column in MD bitshift fixes
+__version__ = "3.6.0"  # Bug fixes (CSV flip, MD signed, stride, int-wrap), auto-format, --zerosexport, unknown format validation
 __author__ = "Jason King"
 __author_github__ = "KingAiCodeForge"
 __author_alias__ = "kingaustraliagg"  # PCMHacking forum username
@@ -158,8 +158,8 @@ class UniversalXDFExporter:
         }
         
         # BASEOFFSET handling for 512KB and other large bin files
-        # When subtract=0: file_address = xdf_address - base_offset (offset points to where data starts in file)
-        # When subtract=1: file_address = xdf_address - base_offset (same, XDF addresses are memory addresses)
+        # When subtract=0: file_address = xdf_address + base_offset (offset is added to XDF address)
+        # When subtract=1: file_address = xdf_address - base_offset (XDF addresses are memory-mapped)
         self.base_offset = 0
         self.base_subtract = 0  # 0 or 1
         
@@ -175,6 +175,7 @@ class UniversalXDFExporter:
         self.flip_rpm = False        # Flip Y-axis (RPM: high→low)
         self.flip_load = False       # Flip X-axis (load: high→low)
         self.no_stats = False        # Omit statistics from output
+        self.zeros_export = True     # Export zeros report (default ON)
     
     def _format_value(self, value: float, decimalpl: int = 2) -> str:
         """
@@ -1373,7 +1374,7 @@ class UniversalXDFExporter:
                 if major_stride < 0:
                     offset = start_address - (row * abs(major_stride_bytes) * cols) + (col * minor_stride_bytes)
                 else:
-                    offset = (row * cols + col) * size_bytes
+                    offset = (row * cols * minor_stride_bytes) + (col * minor_stride_bytes)
                     address = base_address + offset
                 
                 if major_stride < 0:
@@ -1540,7 +1541,7 @@ class UniversalXDFExporter:
                 equation_fixed = re.sub(r'\bA\b', 'int(A)', equation_fixed)
                 equation_fixed = re.sub(r'\bB\b', 'int(B)', equation_fixed)
                 # Clean up double-wrapping: int(int(X)) -> int(X)
-                equation_fixed = re.sub(r'int\(int\(', 'int(', equation_fixed)
+                equation_fixed = re.sub(r'int\(int\(([^)]+)\)\)', r'int(\1)', equation_fixed)
             
             # BUG FIX #3 & #7: Create comprehensive evaluation namespace
             # Default E to 1 (not 0) — for scalars E=element count=1
@@ -1553,8 +1554,8 @@ class UniversalXDFExporter:
                 # Multi-variable support (for tables with axis context)
                 'A': axis_context.get('row_index', 0),
                 'a': axis_context.get('row_index', 0),
-                'B': axis_context.get('col_index', 1),
-                'b': axis_context.get('col_index', 1),
+                'B': max(axis_context.get('col_index', 1), 1),
+                'b': max(axis_context.get('col_index', 1), 1),
                 'C': axis_context.get('c_value', 1),
                 'c': axis_context.get('c_value', 1),
                 'E': axis_context.get('row_index', 1),
@@ -2197,7 +2198,9 @@ class UniversalXDFExporter:
                 
                 for const in self.elements['constants']:
                     raw_value = self.read_value_from_bin(
-                        const['address'], const['size']
+                        const['address'], const['size'],
+                        signed=const.get('signed', False),
+                        lsb_first=const.get('lsb_first', False)
                     )
                     if raw_value is None:
                         continue
@@ -2460,7 +2463,6 @@ class UniversalXDFExporter:
                         tdata, axes = (
                             self._apply_axis_flips(
                                 tdata, axes))
-                        continue
                     y_labels = axes.get(
                         'y', {}).get('labels', [])
                     x_labels = axes.get(
@@ -2501,6 +2503,123 @@ class UniversalXDFExporter:
             self.logger.error(f"CSV export failed: {e}")
             return False
 
+    def export_zeros_report(self, output_path: str) -> bool:
+        """
+        Export a Markdown report of all zero-value scalars and all-zero tables.
+        
+        Scalars: included if their computed value == 0
+        Tables: included if EVERY cell in the data matrix == 0
+        
+        Args:
+            output_path: Output .md file path
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            zero_scalars = []
+            zero_tables = []
+            total_scalars = 0
+            total_tables = 0
+
+            # Scan scalars
+            for const in self.elements['constants']:
+                raw_value = self.read_value_from_bin(
+                    const['address'],
+                    const['size'],
+                    signed=const.get('signed', False),
+                    lsb_first=const.get('lsb_first', False)
+                )
+                if raw_value is None:
+                    continue
+                total_scalars += 1
+
+                value = raw_value
+                if const['equation']:
+                    calc_value, _ = self.evaluate_math(
+                        const['equation'], raw_value,
+                        linked_vars=const.get('linked_vars', {})
+                    )
+                    if calc_value is not None:
+                        value = calc_value
+
+                if value == 0 or value == 0.0:
+                    zero_scalars.append(const)
+
+            # Scan tables
+            for table in self.elements['tables']:
+                table_data = self._read_table_data(table)
+                if table_data is None:
+                    continue
+                total_tables += 1
+
+                flat = [cell for row in table_data for cell in row]
+                if flat and all(cell == 0.0 for cell in flat):
+                    zero_tables.append({
+                        'title': table['title'],
+                        'category': table['category'],
+                        'axes': table['axes'],
+                        'rows': len(table_data),
+                        'cols': len(table_data[0]) if table_data else 0,
+                    })
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(f"# Zero-Value Report\n\n")
+                f.write(f"## Metadata\n\n")
+                f.write(f"| Property | Value |\n")
+                f.write(f"|----------|-------|\n")
+                f.write(f"| Source File | `{self.bin_path.name}` |\n")
+                f.write(f"| Definition | `{self.definition_name}` |\n")
+                f.write(f"| Export Date | {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} |\n")
+                f.write(f"| Exporter | KingAI TunerPro Exporter v{self.VERSION} |\n\n")
+
+                f.write(f"## Summary\n\n")
+                f.write(f"| Category | Zero | Total | Percentage |\n")
+                f.write(f"|----------|------|-------|------------|\n")
+                s_pct = f"{len(zero_scalars)/total_scalars*100:.1f}%" if total_scalars else "N/A"
+                t_pct = f"{len(zero_tables)/total_tables*100:.1f}%" if total_tables else "N/A"
+                f.write(f"| Scalars | {len(zero_scalars)} | {total_scalars} | {s_pct} |\n")
+                f.write(f"| Tables | {len(zero_tables)} | {total_tables} | {t_pct} |\n\n")
+
+                # Zero Scalars
+                f.write(f"---\n\n## Zero Scalars ({len(zero_scalars)})\n\n")
+                if zero_scalars:
+                    f.write(f"| # | Parameter | Address | Unit | Category |\n")
+                    f.write(f"|---|-----------|---------|------|----------|\n")
+                    for i, const in enumerate(zero_scalars, 1):
+                        title = const['title'].replace('|', '\\|')
+                        addr = f"0x{const['address']:04X}" if const['address'] is not None else '-'
+                        unit = const['unit'] or '-'
+                        cat = const['category'] or 'Uncategorized'
+                        f.write(f"| {i} | {title} | {addr} | {unit} | {cat} |\n")
+                else:
+                    f.write(f"No zero-value scalars found.\n")
+
+                # Zero Tables
+                f.write(f"\n---\n\n## All-Zero Tables ({len(zero_tables)})\n\n")
+                if zero_tables:
+                    f.write(f"| # | Table | Size | Category |\n")
+                    f.write(f"|---|-------|------|----------|\n")
+                    for i, t in enumerate(zero_tables, 1):
+                        title = t['title'].replace('|', '\\|')
+                        size = f"{t['rows']}x{t['cols']}"
+                        cat = t['category'] or 'Uncategorized'
+                        f.write(f"| {i} | {title} | {size} | {cat} |\n")
+                    f.write(f"\n---\n\n")
+                    f.write(f"> **Note:** All-zero tables may indicate:\n")
+                    f.write(f"> 1. XDF/BIN version mismatch (wrong definition file)\n")
+                    f.write(f"> 2. Intentional OEM zeroing (e.g., Alpina B3 strategy)\n")
+                    f.write(f"> 3. Unused features in this calibration variant\n")
+                else:
+                    f.write(f"No all-zero tables found.\n")
+
+            self.logger.info(f"Zeros report exported: {output_path}")
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Zeros report export failed: {e}")
+            return False
+
     def export(self, output_path: str) -> bool:
         """
         Main export function - validates, parses, and exports
@@ -2539,7 +2658,7 @@ def main():
         print("Usage:")
         print(f"  python {sys.argv[0]} <xdf> <bin> <output> [format]")
         print()
-        print("Formats:")
+        print("Formats (auto-detected from output extension):")
         print("  txt  - TunerPro-style text export (default)")
         print("  text - Same as txt")
         print("  json - JSON format for programmatic use")
@@ -2552,6 +2671,7 @@ def main():
         print("  --flip-rpm     Flip RPM axis (high-to-low instead of low-to-high)")
         print("  --flip-load    Flip load axis for presentation")
         print("  --no-stats     Omit statistical analysis from output")
+        print("  --no-zerosexport  Disable zeros report (ON by default)")
         print()
         print("Examples:")
         print(f"  python {sys.argv[0]} def.xdf fw.bin out.txt")
@@ -2566,23 +2686,43 @@ def main():
         safe_print("  ✅ Data integrity validation")
         safe_print("  ✅ Multiple output formats (TXT, JSON, MD, CSV)")
         safe_print("  ✅ Axis flip options for presentation preference")
+        safe_print("  ✅ Auto-format detection from file extension")
+        safe_print("  ✅ Zero-value report (_zeros.md) generated by default")
         print()
         sys.exit(1)
     
     xdf_file = positional_args[0]
     bin_file = positional_args[1]
     output_base = positional_args[2]
-    export_format = positional_args[3].lower() if len(positional_args) > 3 else 'txt'
-    
+
+    # Determine format: explicit arg > auto-detect from extension > default txt
+    if len(positional_args) > 3:
+        export_format = positional_args[3].lower()
+    else:
+        # Auto-detect from output file extension
+        ext = Path(output_base).suffix.lower().lstrip('.')
+        ext_map = {'txt': 'txt', 'text': 'txt', 'json': 'json',
+                   'md': 'md', 'markdown': 'md', 'csv': 'csv'}
+        export_format = ext_map.get(ext, 'txt')
+
     # Normalize format
     if export_format == 'text':
         export_format = 'txt'
+    if export_format == 'markdown':
+        export_format = 'md'
+
+    # Validate format
+    if export_format not in {'txt', 'json', 'md', 'csv', 'all'}:
+        print(f"ERROR: Unknown format '{export_format}'")
+        print(f"  Valid formats: txt, json, md, csv, all")
+        sys.exit(1)
     
     # Parse option flags
     show_addresses = '--addresses' in sys.argv
     flip_rpm = '--flip-rpm' in sys.argv
     flip_load = '--flip-load' in sys.argv
     no_stats = '--no-stats' in sys.argv
+    zeros_export = '--no-zerosexport' not in sys.argv
     
     # Create exporter
     exporter = UniversalXDFExporter(xdf_file, bin_file)
@@ -2590,6 +2730,7 @@ def main():
     exporter.flip_rpm = flip_rpm
     exporter.flip_load = flip_load
     exporter.no_stats = no_stats
+    exporter.zeros_export = zeros_export
     
     # Validate and parse
     if not exporter.validate_bin_file():
@@ -2638,6 +2779,12 @@ def main():
         else:
             success = False
     
+    # Zeros report (default ON, generates _zeros.md alongside output)
+    if zeros_export and success:
+        zeros_path = base_dir / f"{base_name}_zeros.md"
+        if exporter.export_zeros_report(str(zeros_path)):
+            outputs.append(('Zeros MD', str(zeros_path)))
+
     # Summary
     print()
     print("=" * 70)
